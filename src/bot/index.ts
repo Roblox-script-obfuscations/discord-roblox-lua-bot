@@ -36,7 +36,7 @@ const AI_CHANNEL = "1511176152964923493";
 const NOTIFY_CHANNEL = "1511170667414818857";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000;   // 新着チェック: 2分
-const VIEW_UPDATE_MS   = 30 * 1000;        // 閲覧数更新: 30秒
+const VIEW_UPDATE_MS   = 5 * 1000;         // 閲覧数更新: 5秒
 
 export const client = new Client({
   intents: [
@@ -54,8 +54,10 @@ const seenScriptIds = new Set<string>();
 let notifyInitialized = false;
 
 // 閲覧数リアルタイム更新トラッカー
-// msgId -> { slug, channelId }
-const viewTrackers = new Map<string, { slug: string; channelId: string }>();
+type ViewTracker =
+  | { type: "search"; slug: string; channelId: string }
+  | { type: "notify"; slug: string; channelId: string; script: import("./scriptblox.js").ScriptResult };
+const viewTrackers = new Map<string, ViewTracker>();
 
 function isAllowed(guildId: string | null, channelId: string): boolean {
   return guildId === ALLOWED_GUILD && channelId === ALLOWED_CHANNEL;
@@ -78,32 +80,43 @@ function splitMessage(text: string, maxLen: number): string[] {
 // ─────────────────────────────────────────────────
 
 async function refreshViewCounts(): Promise<void> {
-  for (const [msgId, { slug, channelId }] of viewTrackers) {
+  for (const [msgId, tracker] of viewTrackers) {
     try {
-      const session = searchSessions.get(msgId);
-      if (!session) { viewTrackers.delete(msgId); continue; }
-
-      const s = session.filtered[session.index];
-      if (!s || s.slug !== slug) continue;
-
-      // 最新の閲覧数を取得
-      const detail = await fetchScriptDetail(slug);
-      if (detail.creator !== undefined) {
-        // views は detail に入っていないので search ではなく直接反映できる情報のみ更新
-        // 注: ScriptBlox の detail API には views が含まれないため、閲覧数は増加推移を反映
-      }
-
       const guild = client.guilds.cache.get(ALLOWED_GUILD);
-      const ch = guild?.channels.cache.get(channelId) as TextChannel | undefined;
+      const ch = guild?.channels.cache.get(tracker.channelId) as TextChannel | undefined;
       if (!ch) continue;
 
-      const msg = await ch.messages.fetch(msgId).catch(() => null);
-      if (!msg) { viewTrackers.delete(msgId); continue; }
+      // 最新の閲覧数を詳細APIから取得
+      const detail = await fetchScriptDetail(tracker.slug);
+      const freshViews = typeof detail.views === "number" ? detail.views : null;
 
-      // 現在のembedから閲覧数フィールドを更新
-      const embed = await buildScriptEmbed(s, session.index, session.filtered.length);
-      const components = msg.components;
-      await msg.edit({ embeds: [embed], components });
+      if (tracker.type === "search") {
+        const session = searchSessions.get(msgId);
+        if (!session) { viewTrackers.delete(msgId); continue; }
+
+        const s = session.filtered[session.index];
+        if (!s || s.slug !== tracker.slug) continue;
+
+        // 閲覧数を反映
+        if (freshViews !== null) s.views = freshViews;
+
+        const msg = await ch.messages.fetch(msgId).catch(() => null);
+        if (!msg) { viewTrackers.delete(msgId); continue; }
+
+        const embed = await buildScriptEmbed(s, session.index, session.filtered.length);
+        await msg.edit({ embeds: [embed], components: msg.components });
+
+      } else {
+        // notify メッセージ
+        const s = tracker.script;
+        if (freshViews !== null) s.views = freshViews;
+
+        const msg = await ch.messages.fetch(msgId).catch(() => null);
+        if (!msg) { viewTrackers.delete(msgId); continue; }
+
+        const embed = await buildNotifyEmbed(s);
+        await msg.edit({ embeds: [embed] });
+      }
     } catch {
       // サイレントに無視
     }
@@ -166,8 +179,12 @@ async function pollNewScripts(): Promise<void> {
     for (const raw of newScripts) {
       const s = await enrichScript(raw);
       const embed = await buildNotifyEmbed(s);
-      await ch.send({ content: "@everyone 新しいスクリプトが投稿されました！", embeds: [embed] });
+      const sent = await ch.send({ content: "@everyone 新しいスクリプトが投稿されました！", embeds: [embed] });
       logger.info({ title: s.title }, "New script notified");
+
+      // 閲覧数リアルタイム監視に登録（1時間後に自動解除）
+      viewTrackers.set(sent.id, { type: "notify", slug: s.slug, channelId: NOTIFY_CHANNEL, script: s });
+      setTimeout(() => viewTrackers.delete(sent.id), 60 * 60 * 1000);
     }
   } catch (err) {
     logger.error({ err }, "Poll new scripts error");
@@ -213,7 +230,7 @@ async function sendSearchResults(
     await sent.edit({ components });
 
     // 閲覧数トラッカー登録
-    viewTrackers.set(sent.id, { slug: filtered[0].slug, channelId: channel.id });
+    viewTrackers.set(sent.id, { type: "search", slug: filtered[0].slug, channelId: channel.id });
 
     // 10分後にクリーンアップ
     setTimeout(() => {
@@ -271,6 +288,7 @@ async function handleButton(btn: ButtonInteraction): Promise<void> {
 
     // 閲覧数トラッカーのslugを更新
     viewTrackers.set(msgId, {
+      type: "search",
       slug: session.filtered[session.index].slug,
       channelId: btn.channelId,
     });
@@ -299,7 +317,7 @@ async function handleButton(btn: ButtonInteraction): Promise<void> {
     }
 
     session.filtered[0] = await enrichScript(session.filtered[0]);
-    viewTrackers.set(msgId, { slug: session.filtered[0].slug, channelId: btn.channelId });
+    viewTrackers.set(msgId, { type: "search", slug: session.filtered[0].slug, channelId: btn.channelId });
   }
 
   const s = session.filtered[session.index];
