@@ -10,11 +10,10 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  ComponentType,
   ButtonInteraction,
   MessageFlags,
 } from "discord.js";
-import { searchScript, fetchLatestScripts, type ScriptResult } from "./scriptblox.js";
+import { searchScript, fetchScriptDetail, fetchLatestScripts, type ScriptResult } from "./scriptblox.js";
 import { getAIResponse } from "./ai.js";
 import { translateToJapanese } from "./translate.js";
 import { logger } from "../lib/logger.js";
@@ -22,8 +21,7 @@ import { logger } from "../lib/logger.js";
 const ALLOWED_GUILD = "1490495338296115364";
 const ALLOWED_CHANNEL = "1510354846111371377";
 const NOTIFY_CHANNEL = "1511170667414818857";
-
-const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2分ごと
+const POLL_INTERVAL_MS = 2 * 60 * 1000;
 
 export const client = new Client({
   intents: [
@@ -35,11 +33,7 @@ export const client = new Client({
 
 let aiChannelId: string | null = null;
 const conversationHistory = new Map<string, { role: "user" | "assistant"; content: string }[]>();
-
-// ボタンセッション: messageId -> { results, index }
 const searchSessions = new Map<string, { results: ScriptResult[]; index: number }>();
-
-// 新着スクリプト通知用: 確認済みID
 const seenScriptIds = new Set<string>();
 let notifyInitialized = false;
 
@@ -47,12 +41,46 @@ function isAllowed(guildId: string | null, channelId: string): boolean {
   return guildId === ALLOWED_GUILD && channelId === ALLOWED_CHANNEL;
 }
 
+function isValidUrl(url: string | null | undefined): url is string {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+// 詳細を補完したScriptResultを返す
+async function enrichScript(s: ScriptResult): Promise<ScriptResult> {
+  if (s.creator && s.features) return s; // 既に補完済み
+  const detail = await fetchScriptDetail(s.slug);
+  return {
+    ...s,
+    creator: detail.creator || s.creator || "Anonymous",
+    features: detail.features || s.features || "",
+    keyLink: detail.keyLink || s.keyLink,
+    imageUrl: detail.imageUrl !== undefined ? detail.imageUrl : s.imageUrl,
+  };
+}
+
 // ────────────────────────────────────────────────────────
-// Embed & Buttons
+// Embed builder
 // ────────────────────────────────────────────────────────
 
-async function buildScriptEmbed(s: ScriptResult, index: number, total: number): Promise<EmbedBuilder> {
-  const descJP = await translateToJapanese(s.description);
+async function buildScriptEmbed(
+  s: ScriptResult,
+  index: number,
+  total: number,
+): Promise<EmbedBuilder> {
+  const descRaw = s.features || "";
+  // features が長い場合はタグ以降を除去してスッキリさせる
+  const descClean = descRaw
+    .replace(/\n*tags?\s*\(.*?\)[\s\S]*/i, "")
+    .replace(/\n*tags?:\s*[\s\S]*/i, "")
+    .trim();
+
+  const descJP = descClean ? await translateToJapanese(descClean) : "";
 
   let descBody = "";
   if (descJP) descBody += descJP + "\n\n";
@@ -60,7 +88,7 @@ async function buildScriptEmbed(s: ScriptResult, index: number, total: number): 
   const scriptBlock =
     s.script.length <= 1800
       ? "```lua\n" + s.script + "\n```"
-      : "```lua\n" + s.script.slice(0, 1800) + "\n...(省略)\n```";
+      : "```lua\n" + s.script.slice(0, 1800) + "\n…(省略)\n```";
 
   descBody += scriptBlock;
 
@@ -68,33 +96,48 @@ async function buildScriptEmbed(s: ScriptResult, index: number, total: number): 
     descBody += `\n\n**Keyシステム:** [Keyを取得する](${s.keyLink})`;
   }
 
+  const badges: string[] = [];
+  if (s.isUniversal) badges.push("Universal");
+  if (s.isHub) badges.push("Hub");
+  if (s.isPatched) badges.push("Patched");
+
   const embed = new EmbedBuilder()
-    .setColor(Colors.Blue)
-    .setTitle(s.title)
+    .setColor(s.isPatched ? Colors.Red : Colors.Blue)
+    .setTitle(
+      (badges.length ? `[${badges.join(" | ")}] ` : "") + s.title,
+    )
     .setURL(`https://scriptblox.com/script/${s.slug}`)
     .addFields(
-      { name: "ゲーム", value: s.game, inline: true },
+      { name: "ゲーム", value: s.game || "Unknown", inline: true },
       { name: "閲覧数", value: s.views.toLocaleString(), inline: true },
       { name: "認証済み", value: s.verified ? "✓ はい" : "✗ いいえ", inline: true },
     )
     .setDescription(descBody.slice(0, 4096))
-    .setFooter({ text: `作成者: ${s.creator}　|　${s.game}　|　${index + 1} / ${total}` })
+    .setFooter({
+      text: `作成者: ${s.creator || "Anonymous"}　|　${s.game}　|　${index + 1} / ${total}`,
+    })
     .setTimestamp(s.createdAt ? new Date(s.createdAt) : new Date());
 
-  if (s.imageUrl) embed.setThumbnail(s.imageUrl);
+  if (isValidUrl(s.imageUrl)) {
+    embed.setThumbnail(s.imageUrl);
+  }
 
   return embed;
 }
 
-function buildNavRow(messageId: string, index: number, total: number): ActionRowBuilder<ButtonBuilder> {
+function buildNavRow(
+  msgId: string,
+  index: number,
+  total: number,
+): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`search_prev_${messageId}`)
+      .setCustomId(`sp_${msgId}`)
       .setLabel("PREV")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(index === 0),
     new ButtonBuilder()
-      .setCustomId(`search_next_${messageId}`)
+      .setCustomId(`sn_${msgId}`)
       .setLabel("NEXT")
       .setStyle(ButtonStyle.Primary)
       .setDisabled(index >= total - 1),
@@ -102,11 +145,17 @@ function buildNavRow(messageId: string, index: number, total: number): ActionRow
 }
 
 // ────────────────────────────────────────────────────────
-// 新着通知 embed
+// Notify embed
 // ────────────────────────────────────────────────────────
 
 async function buildNotifyEmbed(s: ScriptResult): Promise<EmbedBuilder> {
-  const descJP = await translateToJapanese(s.description);
+  const descRaw = s.features || "";
+  const descClean = descRaw
+    .replace(/\n*tags?\s*\(.*?\)[\s\S]*/i, "")
+    .replace(/\n*tags?:\s*[\s\S]*/i, "")
+    .trim();
+
+  const descJP = descClean ? await translateToJapanese(descClean) : "";
 
   let descBody = "";
   if (descJP) descBody += descJP + "\n\n";
@@ -114,7 +163,7 @@ async function buildNotifyEmbed(s: ScriptResult): Promise<EmbedBuilder> {
   const scriptBlock =
     s.script.length <= 1800
       ? "```lua\n" + s.script + "\n```"
-      : "```lua\n" + s.script.slice(0, 1800) + "\n...(省略)\n```";
+      : "```lua\n" + s.script.slice(0, 1800) + "\n…(省略)\n```";
 
   descBody += scriptBlock;
 
@@ -127,21 +176,23 @@ async function buildNotifyEmbed(s: ScriptResult): Promise<EmbedBuilder> {
     .setTitle(s.title)
     .setURL(`https://scriptblox.com/script/${s.slug}`)
     .addFields(
-      { name: "ゲーム", value: s.game, inline: true },
+      { name: "ゲーム", value: s.game || "Unknown", inline: true },
       { name: "閲覧数", value: s.views.toLocaleString(), inline: true },
       { name: "認証済み", value: s.verified ? "✓ はい" : "✗ いいえ", inline: true },
     )
     .setDescription(descBody.slice(0, 4096))
-    .setFooter({ text: `作成者: ${s.creator}　|　${s.game}` })
+    .setFooter({ text: `作成者: ${s.creator || "Anonymous"}　|　${s.game}` })
     .setTimestamp(s.createdAt ? new Date(s.createdAt) : new Date());
 
-  if (s.imageUrl) embed.setThumbnail(s.imageUrl);
+  if (isValidUrl(s.imageUrl)) {
+    embed.setThumbnail(s.imageUrl);
+  }
 
   return embed;
 }
 
 // ────────────────────────────────────────────────────────
-// 新着ポーリング
+// New-script polling
 // ────────────────────────────────────────────────────────
 
 async function pollNewScripts(): Promise<void> {
@@ -155,7 +206,9 @@ async function pollNewScripts(): Promise<void> {
       return;
     }
 
-    const newScripts = scripts.filter(s => s.scriptId && !seenScriptIds.has(s.scriptId));
+    const newScripts = scripts.filter(
+      (s) => s.scriptId && !seenScriptIds.has(s.scriptId),
+    );
     for (const s of newScripts) seenScriptIds.add(s.scriptId);
 
     if (newScripts.length === 0) return;
@@ -166,9 +219,13 @@ async function pollNewScripts(): Promise<void> {
     const ch = guild.channels.cache.get(NOTIFY_CHANNEL) as TextChannel | undefined;
     if (!ch) return;
 
-    for (const s of newScripts) {
+    for (const raw of newScripts) {
+      const s = await enrichScript(raw);
       const embed = await buildNotifyEmbed(s);
-      await ch.send({ content: "@everyone 新しいスクリプトが投稿されました！", embeds: [embed] });
+      await ch.send({
+        content: "@everyone 新しいスクリプトが投稿されました！",
+        embeds: [embed],
+      });
       logger.info({ title: s.title }, "New script notified");
     }
   } catch (err) {
@@ -186,20 +243,24 @@ client.once(Events.ClientReady, (c) => {
   setInterval(pollNewScripts, POLL_INTERVAL_MS);
 });
 
-// ボタンインタラクション
+// Button interactions
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton()) return;
   const btn = interaction as ButtonInteraction;
-
   const id = btn.customId;
-  if (!id.startsWith("search_prev_") && !id.startsWith("search_next_")) return;
 
-  const isPrev = id.startsWith("search_prev_");
-  const originalMsgId = id.replace("search_prev_", "").replace("search_next_", "");
+  const isPrev = id.startsWith("sp_");
+  const isNext = id.startsWith("sn_");
+  if (!isPrev && !isNext) return;
 
+  const originalMsgId = id.slice(3);
   const session = searchSessions.get(originalMsgId);
+
   if (!session) {
-    await btn.reply({ content: "セッションが期限切れです。再度検索してください。", flags: MessageFlags.Ephemeral });
+    await btn.reply({
+      content: "セッションが期限切れです。再度 `!search_` で検索してください。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
@@ -207,21 +268,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
     ? Math.max(0, session.index - 1)
     : Math.min(session.results.length - 1, session.index + 1);
 
-  const s = session.results[session.index];
-  const embed = await buildScriptEmbed(s, session.index, session.results.length);
-  const row = buildNavRow(originalMsgId, session.index, session.results.length);
-
-  await btn.update({ embeds: [embed], components: [row] });
+  try {
+    await btn.deferUpdate();
+    const s = await enrichScript(session.results[session.index]);
+    session.results[session.index] = s; // キャッシュ
+    const embed = await buildScriptEmbed(s, session.index, session.results.length);
+    const row = buildNavRow(originalMsgId, session.index, session.results.length);
+    await btn.editReply({ embeds: [embed], components: [row] });
+  } catch (err) {
+    logger.error({ err }, "Button interaction error");
+  }
 });
 
-// メッセージ
+// Messages
 client.on(Events.MessageCreate, async (message: Message) => {
   if (message.author.bot) return;
   if (!isAllowed(message.guildId, message.channelId)) return;
 
   const content = message.content.trim();
 
-  // !set / !unset
   if (content === "!set") {
     aiChannelId = message.channelId;
     conversationHistory.clear();
@@ -230,8 +295,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
       .setTitle("AI自動応答 有効")
       .setDescription(
         `<#${message.channelId}> でAI自動応答を開始しました。\n` +
-        `Roblox Luaの質問・難読化・リバースエンジニアリングに対応します。\n\n` +
-        `停止するには \`!unset\` を送信してください。`,
+          `Roblox Luaの質問・難読化・リバースエンジニアリングに対応します。\n\n` +
+          `停止するには \`!unset\` を送信してください。`,
       )
       .setTimestamp();
     await message.reply({ embeds: [embed] });
@@ -250,11 +315,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
-  // !search_{query}
   if (content.startsWith("!search_")) {
     const query = content.slice("!search_".length).trim();
     if (!query) {
-      await message.reply("スクリプト名を指定してください。例: `!search_infinite jump`");
+      await message.reply(
+        "スクリプト名を指定してください。例: `!search_infinite jump`",
+      );
       return;
     }
 
@@ -263,38 +329,41 @@ client.on(Events.MessageCreate, async (message: Message) => {
       const results = await searchScript(query, 20);
 
       if (results.length === 0) {
-        await message.reply(`"${query}" に関するスクリプトが見つかりませんでした。`);
+        await message.reply(
+          `"${query}" に関するスクリプトが見つかりませんでした。`,
+        );
         return;
       }
 
-      const s = results[0];
-      const embed = await buildScriptEmbed(s, 0, results.length);
-      const row = buildNavRow("PLACEHOLDER", 0, results.length);
+      // 1件目を詳細補完
+      const first = await enrichScript(results[0]);
+      results[0] = first;
 
-      // まずメッセージを送信してIDを取得
+      const embed = await buildScriptEmbed(first, 0, results.length);
+
+      // まず仮のボタン（ID確定前）なしで送信
       const sent = await (message.channel as TextChannel).send({
         embeds: [embed],
-        components: results.length > 1 ? [row] : [],
       });
 
-      // セッションをメッセージIDで登録し、ボタンのcustomIdも更新
       if (results.length > 1) {
         searchSessions.set(sent.id, { results, index: 0 });
+        const row = buildNavRow(sent.id, 0, results.length);
+        await sent.edit({ components: [row] });
 
-        const realRow = buildNavRow(sent.id, 0, results.length);
-        await sent.edit({ components: [realRow] });
-
-        // 10分後にセッションクリーンアップ
-        setTimeout(() => {
-          searchSessions.delete(sent.id);
-        }, 10 * 60 * 1000);
+        setTimeout(() => searchSessions.delete(sent.id), 10 * 60 * 1000);
       }
 
-      // スクリプトが長い場合はファイル添付
-      if (s.script.length > 1800) {
+      // スクリプト全文が長い場合はファイル添付
+      if (first.script.length > 1800) {
         await (message.channel as TextChannel).send({
-          content: "`script.lua` (全文)",
-          files: [{ name: "script.lua", attachment: Buffer.from(s.script, "utf-8") }],
+          content: "`script.lua` 全文",
+          files: [
+            {
+              name: "script.lua",
+              attachment: Buffer.from(first.script, "utf-8"),
+            },
+          ],
         });
       }
     } catch (err) {
@@ -304,7 +373,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
-  // AI自動応答
+  // AI auto-reply
   if (aiChannelId === message.channelId) {
     const userId = message.author.id;
     const history = conversationHistory.get(userId) ?? [];
@@ -318,8 +387,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       if (history.length > 20) history.splice(0, 2);
       conversationHistory.set(userId, history);
 
-      const chunks = splitMessage(reply, 1990);
-      for (const chunk of chunks) {
+      for (const chunk of splitMessage(reply, 1990)) {
         await message.reply(chunk);
       }
     } catch (err) {
