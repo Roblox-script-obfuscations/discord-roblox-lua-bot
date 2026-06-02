@@ -76,6 +76,7 @@ export async function fetchScriptDetail(slug: string): Promise<Partial<ScriptRes
       features: (s.features as string) || "",
       keyLink: (s.keyLink as string) || null,
       imageUrl,
+      views: typeof s.views === "number" ? s.views : undefined,
     };
   } catch {
     return {};
