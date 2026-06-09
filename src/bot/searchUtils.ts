@@ -9,7 +9,7 @@ import { fetchScriptDetail, type ScriptResult } from "./scriptblox.js";
 import { translateToJapanese } from "./translate.js";
 
 // ─────────────────────────────────────────────────
-// Shared state
+// Session state
 // ─────────────────────────────────────────────────
 
 export interface SearchSession {
@@ -27,15 +27,11 @@ export interface SearchSession {
 
 export const searchSessions = new Map<string, SearchSession>();
 
-let _aiChannelId: string | null = null;
-export function getAiChannelId(): string | null { return _aiChannelId; }
-export function setAiChannelId(id: string | null): void { _aiChannelId = id; }
-
 // translation cache keyed by slug
 const translationCache = new Map<string, string>();
 
 // ─────────────────────────────────────────────────
-// Enrich a script with detail API data
+// Enrich script with detail API data
 // ─────────────────────────────────────────────────
 
 export async function enrichScript(s: ScriptResult): Promise<ScriptResult> {
@@ -43,10 +39,11 @@ export async function enrichScript(s: ScriptResult): Promise<ScriptResult> {
   const detail = await fetchScriptDetail(s.slug);
   return {
     ...s,
-    creator: detail.creator || s.creator || "Anonymous",
-    features: detail.features || s.features || "",
-    keyLink: detail.keyLink ?? s.keyLink,
+    creator:  detail.creator  ?? s.creator  ?? "Anonymous",
+    features: detail.features ?? s.features ?? "",
+    keyLink:  detail.keyLink  ?? s.keyLink,
     imageUrl: detail.imageUrl !== undefined ? detail.imageUrl : s.imageUrl,
+    views:    typeof detail.views === "number" ? detail.views : s.views,
   };
 }
 
@@ -71,7 +68,6 @@ export async function buildScriptEmbed(
   index: number,
   total: number,
 ): Promise<EmbedBuilder> {
-  // Translation (cached per slug)
   let descJP = translationCache.get(s.slug) ?? "";
   if (!descJP && s.features) {
     const clean = s.features
@@ -89,8 +85,7 @@ export async function buildScriptEmbed(
       ? "```lua\n" + s.script + "\n```"
       : "```lua\n" + s.script.slice(0, 1800) + "\n…(省略)\n```";
 
-  let descBody = "";
-  if (descJP) descBody += descJP + "\n\n";
+  let descBody = descJP ? descJP + "\n\n" : "";
   descBody += scriptBlock;
   if (s.keySystem && s.keyLink) {
     descBody += `\n\n**Keyシステム:** [Keyを取得する](${s.keyLink})`;
@@ -106,9 +101,9 @@ export async function buildScriptEmbed(
     .setTitle((badges.length ? `[${badges.join(" | ")}] ` : "") + s.title)
     .setURL(`https://scriptblox.com/script/${s.slug}`)
     .addFields(
-      { name: "ゲーム", value: s.game || "Unknown", inline: true },
-      { name: "閲覧数", value: s.views.toLocaleString(), inline: true },
-      { name: "認証済み", value: s.verified ? "✓ はい" : "✗ いいえ", inline: true },
+      { name: "ゲーム",   value: s.game || "Unknown",                    inline: true },
+      { name: "閲覧数",   value: s.views.toLocaleString(),                inline: true },
+      { name: "認証済み", value: s.verified ? "✓ はい" : "✗ いいえ",     inline: true },
     )
     .setDescription(descBody.slice(0, 4096))
     .setFooter({ text: `作成者: ${s.creator || "Anonymous"}　|　${s.game}　|　${index + 1} / ${total}` })
@@ -119,7 +114,7 @@ export async function buildScriptEmbed(
 }
 
 // ─────────────────────────────────────────────────
-// Build navigation row
+// Navigation row
 // ─────────────────────────────────────────────────
 
 export function buildNavRow(
@@ -142,7 +137,7 @@ export function buildNavRow(
 }
 
 // ─────────────────────────────────────────────────
-// Build filter row
+// Filter row
 // ─────────────────────────────────────────────────
 
 export function buildFilterRow(
@@ -153,7 +148,7 @@ export function buildFilterRow(
     new ButtonBuilder()
       .setCustomId(`sf_v_${msgId}`)
       .setLabel("認証済み")
-      .setStyle(filters.verified ? ButtonStyle.Success : ButtonStyle.Secondary),
+      .setStyle(filters.verified  ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`sf_k_${msgId}`)
       .setLabel("Key System")
@@ -165,7 +160,7 @@ export function buildFilterRow(
     new ButtonBuilder()
       .setCustomId(`sf_h_${msgId}`)
       .setLabel("Hub")
-      .setStyle(filters.hub ? ButtonStyle.Success : ButtonStyle.Secondary),
+      .setStyle(filters.hub       ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`sf_r_${msgId}`)
       .setLabel("リセット")
@@ -175,7 +170,7 @@ export function buildFilterRow(
 }
 
 // ─────────────────────────────────────────────────
-// Apply filters client-side
+// Apply filters
 // ─────────────────────────────────────────────────
 
 export function applyFilters(
@@ -183,10 +178,10 @@ export function applyFilters(
   filters: SearchSession["filters"],
 ): ScriptResult[] {
   return results.filter(s => {
-    if (filters.verified && !s.verified) return false;
-    if (filters.keySystem && !s.keySystem) return false;
+    if (filters.verified  && !s.verified)   return false;
+    if (filters.keySystem && !s.keySystem)  return false;
     if (filters.universal && !s.isUniversal) return false;
-    if (filters.hub && !s.isHub) return false;
+    if (filters.hub       && !s.isHub)      return false;
     return true;
   });
 }
